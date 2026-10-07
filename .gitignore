@@ -2,3 +2,4 @@ copy/
 
 *.pdf
 AGENTS.md
+.claude/

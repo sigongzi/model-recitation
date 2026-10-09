@@ -596,7 +596,7 @@ DCA不是为了减轻计算设计的，而是为了能让只在262144长度上�
 
 这个主要是发现比较远的信息和精确的位置数值无关，只和qk的具体数值有关，所以就都设置成了离得远就采用最大值来编码
 
-另外对于长序列还会有一个补偿 $alpha = max(0.1 dot ln("len" / 262144) + 1, 1)$，但它不是乘在k上。cache里的k从头到尾都是"裸"的，没有温度系数；这个$alpha$在prefill时乘在softmax_scale上，decode时乘在当前的q上（三个q都乘），效果等价于每步attention的logits统一乘上当前长度的$alpha$
+另外对于长序列还会有一个补偿 $alpha = max(0.1 dot ln("len" / 262144) + 1, 1)$，每个k在写入cache的那一刻乘上它，存进去后就不再变（源码里prefill按每条序列的$alpha$逐段`mul_`，decode的新token在写入前也乘当步的）
 
 如果是800000长度的序列，那么$alpha = 0.1 dot ln(800000 / 262144) + 1 = 1.1116$
 
@@ -629,7 +629,9 @@ DCA不是为了减轻计算设计的，而是为了能让只在262144长度上�
 
 那么计算公式是
 
-$2d + d^2 times 2 + d^2 times 2/r ("o + q + k + v proj") + 3 times i d ("gate + up + down")$
+$2d + d^2 times 2 + d^2 times 2/r ("o + q + k + v proj") + 3 times i d ("gate + up + down") + d + 2d/r ("qkv bias")$
+
+q、k、v三个proj带bias：config里没写attention_bias，Qwen2Config默认true（transformers main上直接写死bias=True），o_proj和MLP没有bias，Qwen3起默认改成false。所以只有qkv每个是"权重+bias"两份
 
 *qwen家族的GQA比例不是固定的1:8*，每个尺寸都得单独查config.json，顺手全查了一遍：
 
@@ -651,15 +653,15 @@ $2d + d^2 times 2 + d^2 times 2/r ("o + q + k + v proj") + 3 times i d ("gate + 
 
 MLP的参数量 $3 times 8192 times 29568 = 726,663,168$
 
-Attention的参数量 $2 times 8192 times 8192 ("q + o") + 2 times 8192 times 1024 ("k + v") = 150,994,944$
+Attention的参数量 $2 times 8192 times 8192 ("q + o") + 2 times 8192 times 1024 ("k + v") = 150,994,944$，qkv的bias是 $8192 + 1024 + 1024 = 10,240$（o_proj没有bias）
 
 两个Norm $8192 times 2 = 16,384$
 
-每一层加起来是 $726,663,168 + 150,994,944 + 16,384 = 877,674,496$ 大约是877 M
+每一层加起来是 $726,663,168 + 150,994,944 + 16,384 + 10,240 = 877,684,736$ 大约是877.7 M
 
-写成d的形式是 $2.25d^2 + 3 i d + 2d$，又因为$i / d = 231 / 64$，也就是约$13.08d^2 + 2d$（attention因为GQA比llama省了$1.75d^2$，但MLP被随机的intermediate_size撑大了，单层反而比llama的$12d^2 + 2d$还重）
+写成d的形式是 $2.25d^2 + 3 i d + 2d + 1.25d ("bias = d + 2d/r")$，又因为$i / d = 231 / 64$，也就是约$13.08d^2 + 3.25d$（attention因为GQA比llama省了$1.75d^2$，但MLP被随机的intermediate_size撑大了，单层反而比llama的$12d^2 + 2d$还重）
 
-80层一共有 $877,674,496 times 80 = 70,213,959,680$ 大约是70.2 B
+80层一共有 $877,684,736 times 80 = 70,214,778,880$ 大约是70.2 B
 
 零碎权重
 
@@ -667,8 +669,8 @@ Attention的参数量 $2 times 8192 times 8192 ("q + o") + 2 times 8192 times 10
 
 一个token_embedding，一个lm_head（"tie_word_embeddings": false所以是两份）：$8192 times 152064 times 2 = 2,491,416,576$ 大约是2.49 B （因为词表和hidden size都长了，所以加起来就比较大了）
 
-加和后 $70,213,959,680 + 2,491,416,576 + 8192 = 72,705,384,448$
+加和后 $70,214,778,880 + 2,491,416,576 + 8192 = 72,706,203,648$
 
-约$72.7B$，和名字里的72B对上了
+约$72.7B$，和名字里的72B对上了；和官方还能对得更严：safetensors全部分片的total_size是$145,412,407,296$字节，$div 2$（bf16）恰好等于这个数。没算bias的版本算出来是$72,705,384,448$，差的$819,200$正好是80层 $times 10,240$ 的qkv bias
 
 
